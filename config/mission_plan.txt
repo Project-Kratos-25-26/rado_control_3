@@ -1,0 +1,4 @@
+pickup,yellow,15.393048,73.881117
+dropoff,yellow,15.393360,73.880695
+dropoff,red,0.00,0.00
+pickup,red,0.00,0.00
