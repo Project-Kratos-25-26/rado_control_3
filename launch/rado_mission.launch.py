@@ -13,16 +13,6 @@ def generate_launch_description():
     # Web GUI / Remote Interface
     # -------------------------
 
-    rosbridge = IncludeLaunchDescription(
-        XMLLaunchDescriptionSource(
-            os.path.join(
-                get_package_share_directory('rosbridge_server'),
-                'launch',
-                'rosbridge_websocket_launch.xml'
-            )
-        )
-    )
-
     web_video = Node(
         package='web_video_server',
         executable='web_video_server',
@@ -109,7 +99,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         # Web GUI
-        rosbridge,
         web_video,
 
         # Mission stack

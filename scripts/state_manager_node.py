@@ -6,7 +6,7 @@ from std_msgs.msg import String, Bool
 class StateManager(Node):
     def __init__(self):
         super().__init__('state_manager')
-        self.state = 'IDLE' # Default to IDLE
+        self.state = 'AUTONOMOUS' # Default to IDLE
         # Publisher to inform other nodes of the current state
         self.state_pub = self.create_publisher(String, '/system/state', 10)
         

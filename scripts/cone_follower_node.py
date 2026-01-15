@@ -9,11 +9,16 @@ from geometry_msgs.msg import Twist
 import json
 import math
 import time
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 class ConeFollower(Node):
     def __init__(self):
         super().__init__('cone_follower')
-
+        self.mavros_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT
+        )
         # -------------------------------------------------------------------------
         # 1.1: State Variables
         # These variables keep track of what the robot is doing and seeing.
@@ -61,7 +66,7 @@ class ConeFollower(Node):
         # Subscribers: Listening for messages IN
         self.create_subscription(String, '/cone_detector/detections', self.detection_callback, 10) # Camera data
         self.create_subscription(String, '/auto/cone_follow/trigger', self.trigger_callback, 10)   # remote control / brain commands
-        self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self.compass_callback, 10)  # Compass heading
+        self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self.compass_callback, self.mavros_qos)  # Compass heading
 
         # Timer: The heartbeat of the node. Runs the control loop 10 times a second (0.1s).
         self.timer = self.create_timer(0.1, self.control_loop)

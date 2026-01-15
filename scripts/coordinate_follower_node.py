@@ -18,11 +18,16 @@ import os
 import time
 import math
 from pathlib import Path
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 class MissionManager(Node):
     def __init__(self):
         super().__init__('mission_manager')
+        self.mavros_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT
+        )
 
         # Parameters
         self.declare_parameter('map_frame', 'map')
@@ -52,7 +57,7 @@ class MissionManager(Node):
             )
 
         # State machine
-        self.internal_state = 'IDLE'
+        self.internal_state = 'WAITING_FOR_AUTONOMOUS'
         self.mission_goals = []
         self.current_goal = None
         self.current_goal_index = -1
@@ -100,7 +105,7 @@ class MissionManager(Node):
             String, '/gcs/command', self.gcs_command_callback, 10
         )
         self.create_subscription(
-            NavSatFix, '/mavros/global_position/global', self.gps_callback, 10
+            NavSatFix, '/mavros/global_position/global', self.gps_callback, self.mavros_qos
         )
         self.create_subscription(
             String, '/auto/cone_follow/status', self.cone_status_callback, 10
