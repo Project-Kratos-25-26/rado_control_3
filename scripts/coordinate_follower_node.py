@@ -177,22 +177,26 @@ class MissionManager(Node):
                 
                 if len(self.mission_queue) > 0:
                     self.current_goal = self.mission_queue[0]
-                    self.internal_state = 'WAITING_FOR_AUTONOMOUS'
                     self.get_logger().info(
                         f"Starting mission queue ({len(self.mission_queue)} waypoints). "
                         f"First: {self.current_goal['type']} {self.current_goal['color']} "
                         f"at ({self.current_goal['lat']:.6f}, {self.current_goal['lon']:.6f})"
                     )
+                    # Start navigation immediately
+                    self.internal_state = 'NAV2_NAVIGATING'
+                    self.send_nav2_goal()
                 elif self.current_goal:
                     # Fallback to single goal mode
                     self.mission_queue = [self.current_goal]
                     self.mission_queue_index = 0
-                    self.internal_state = 'WAITING_FOR_AUTONOMOUS'
                     self.get_logger().info(
                         f"Proceeding to goal: {self.current_goal['type']} "
                         f"{self.current_goal['color']} at ({self.current_goal['lat']:.6f}, "
                         f"{self.current_goal['lon']:.6f})"
                     )
+                    # Start navigation immediately
+                    self.internal_state = 'NAV2_NAVIGATING'
+                    self.send_nav2_goal()
                 else:
                     self.get_logger().warn("No waypoints in queue. Add waypoints first.")
         elif command == 'MANUAL':
