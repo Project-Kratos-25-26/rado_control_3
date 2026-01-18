@@ -13,8 +13,6 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import NavSatFix
 from nav2_msgs.action import NavigateToPose
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
-from tf2_geometry_msgs import do_transform_pose
-from geometry_msgs.msg import TransformStamped
 import tf_transformations
 import os
 import time
@@ -34,29 +32,9 @@ class MissionManager(Node):
         # Parameters
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('gps_origin_lat', 0.0)  # Set your map origin (0.0 = auto-detect)
-        self.declare_parameter('gps_origin_lon', 0.0)  # Set your map origin (0.0 = auto-detect)
-        self.declare_parameter('gps_stabilization_samples', 10)  # Number of GPS samples for stabilization
-        self.declare_parameter('gps_stabilization_threshold', 0.00001)  # Max std dev for stabilization (degrees)
         
         self.map_frame = self.get_parameter('map_frame').value
         self.base_frame = self.get_parameter('base_frame').value
-        self.gps_origin_lat = self.get_parameter('gps_origin_lat').value
-        self.gps_origin_lon = self.get_parameter('gps_origin_lon').value
-        self.gps_stabilization_samples = self.get_parameter('gps_stabilization_samples').value
-        self.gps_stabilization_threshold = self.get_parameter('gps_stabilization_threshold').value
-        
-        # GPS origin initialization state
-        self.gps_origin_initialized = False
-        self.gps_init_samples_lat = []
-        self.gps_init_samples_lon = []
-        
-        # Check if origin was provided via parameters
-        if self.gps_origin_lat != 0.0 or self.gps_origin_lon != 0.0:
-            self.gps_origin_initialized = True
-            self.get_logger().info(
-                f'GPS origin set from parameters: ({self.gps_origin_lat:.6f}, {self.gps_origin_lon:.6f})'
-            )
 
         # State machine
         self.internal_state = 'WAITING_FOR_AUTONOMOUS'
@@ -69,12 +47,10 @@ class MissionManager(Node):
         self.mission_queue = []  # List of goals to process
         self.mission_queue_index = 0  # Current position in queue
         
-        # Navigation State
-        self.current_lat = 0.0
-        self.current_lon = 0.0
+        # Navigation State (robot position in map frame)
+        self.current_x = 0.0
+        self.current_y = 0.0
         self.current_heading = 0.0
-        self._calib_heading_samples = []
-        self._calib_heading_times = []
         
         # --- TUNING PARAMETERS ---
         self.cone_switch_distance = 0.5  # Meters - when to switch from Nav2 to cone following
@@ -136,21 +112,10 @@ class MissionManager(Node):
         self.get_logger().info('Mission Manager (Nav2 Integrated) Initialized.')
         self.get_logger().info(f'Loaded {len(self.mission_goals)} mission goals.')
         
-        # --- GPS_MAP to MAP calibration ---
-        # gps_map frame = ENU frame centered at GPS origin
-        # We need to find the transform from gps_map to RTAB-Map's map frame
-        self.gps_map_to_map_yaw = 0.0   # Rotation from gps_map to map (radians)
-        self.gps_map_to_map_tx = 0.0    # Translation X
-        self.gps_map_to_map_ty = 0.0    # Translation Y
-        self.gps_map_calibrated = False
-        
         # Wait for Nav2 action server
         self.create_timer(1.0, self.check_nav2_ready)
-        
-        # Calibration timer - runs until calibration succeeds
-        self.calibration_timer = self.create_timer(1.0, self._try_calibrate_gps_to_map)
 
-    def check_nav2_ready(self):
+    def check_nav2_ready(self)  :
         """Check if Nav2 action server is available"""
         if not self.nav2_client.server_is_ready():
             self.get_logger().info('Waiting for Nav2 action server...', throttle_duration_sec=5)
@@ -158,7 +123,7 @@ class MissionManager(Node):
             self.get_logger().info('Nav2 action server is ready!')
 
     def load_mission(self):
-        """Load mission waypoints from file"""
+        """Load mission waypoints from file (x, y in map coordinates)"""
         self.mission_goals = []
         try:
             if os.path.exists(self.mission_file_path):
@@ -170,8 +135,8 @@ class MissionManager(Node):
                                 goal = {
                                     'type': parts[0].lower().strip(),
                                     'color': parts[1].lower().strip(),
-                                    'lat': float(parts[2]),
-                                    'lon': float(parts[3])
+                                    'x': float(parts[2]),
+                                    'y': float(parts[3])
                                 }
                                 self.mission_goals.append(goal)
                             except ValueError as e:
@@ -198,7 +163,7 @@ class MissionManager(Node):
                     self.get_logger().info(
                         f"Starting mission queue ({len(self.mission_queue)} waypoints). "
                         f"First: {self.current_goal['type']} {self.current_goal['color']} "
-                        f"at ({self.current_goal['lat']:.6f}, {self.current_goal['lon']:.6f})"
+                        f"at ({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
                     )
                     # Start navigation immediately
                     self.internal_state = 'NAV2_NAVIGATING'
@@ -209,8 +174,8 @@ class MissionManager(Node):
                     self.mission_queue_index = 0
                     self.get_logger().info(
                         f"Proceeding to goal: {self.current_goal['type']} "
-                        f"{self.current_goal['color']} at ({self.current_goal['lat']:.6f}, "
-                        f"{self.current_goal['lon']:.6f})"
+                        f"{self.current_goal['color']} at ({self.current_goal['x']:.2f}, "
+                        f"{self.current_goal['y']:.2f})"
                     )
                     # Start navigation immediately
                     self.internal_state = 'NAV2_NAVIGATING'
@@ -234,19 +199,19 @@ class MissionManager(Node):
         try:
             parts = msg.data.split('|')
             
-            # New queue format: QUEUE|index|type|color|lat|lon
+            # New queue format: QUEUE|index|type|color|x|y
             if len(parts) >= 6 and parts[0] == 'QUEUE':
                 queue_idx = int(parts[1])
                 goal_type = parts[2].lower().strip()
                 color = parts[3].lower().strip()
-                lat = float(parts[4])
-                lon = float(parts[5])
+                x = float(parts[4])
+                y = float(parts[5])
                 
                 goal = {
                     'type': goal_type,
                     'color': color,
-                    'lat': lat,
-                    'lon': lon,
+                    'x': x,
+                    'y': y,
                     'queue_index': queue_idx
                 }
                 
@@ -259,22 +224,22 @@ class MissionManager(Node):
                 self.current_goal = goal
                 
                 self.get_logger().info(
-                    f"Queue Goal #{queue_idx + 1} Added: {goal_type} {color} at ({lat:.6f}, {lon:.6f}). Queue size: {len([g for g in self.mission_queue if g])}"
+                    f"Queue Goal #{queue_idx + 1} Added: {goal_type} {color} at ({x:.2f}, {y:.2f}). Queue size: {len([g for g in self.mission_queue if g])}"
                 )
                 self.internal_state = 'WAITING_FOR_PROCEED'
             
-            # Legacy format: GOAL|type|color|lat|lon
+            # Legacy format: GOAL|type|color|x|y
             elif len(parts) >= 5 and parts[0] == 'GOAL':
                 goal_type = parts[1].lower().strip()
                 color = parts[2].lower().strip()
-                lat = float(parts[3])
-                lon = float(parts[4])
+                x = float(parts[3])
+                y = float(parts[4])
                 
                 self.current_goal = {
                     'type': goal_type,
                     'color': color,
-                    'lat': lat,
-                    'lon': lon,
+                    'x': x,
+                    'y': y,
                     'queue_index': -1
                 }
                 
@@ -283,7 +248,7 @@ class MissionManager(Node):
                 self.mission_queue_index = 0
                 
                 self.get_logger().info(
-                    f"GUI Goal Set: {goal_type} {color} at ({lat:.6f}, {lon:.6f})"
+                    f"GUI Goal Set: {goal_type} {color} at ({x:.2f}, {y:.2f})"
                 )
                 self.internal_state = 'WAITING_FOR_PROCEED'
             else:
@@ -315,7 +280,7 @@ class MissionManager(Node):
             self.current_goal = next_goal
             self.get_logger().info(
                 f"Selected Goal: {next_goal['type']} {next_goal['color']} "
-                f"at ({next_goal['lat']:.6f}, {next_goal['lon']:.6f})"
+                f"at ({next_goal['x']:.2f}, {next_goal['y']:.2f})"
             )
             self.internal_state = 'WAITING_FOR_AUTONOMOUS'
         else:
@@ -336,70 +301,28 @@ class MissionManager(Node):
                 self.cone_trigger_pub.publish(String(data="STOP"))
 
     def gps_callback(self, msg):
-        """Update current GPS position and initialize origin if needed"""
-        self.current_lat = msg.latitude
-        self.current_lon = msg.longitude
-        
-        # Auto-initialize GPS origin if not set
-        if not self.gps_origin_initialized:
-            self._collect_gps_for_origin(msg.latitude, msg.longitude)
+        """Update current position from TF (map -> base_link)"""
+        # GPS callback kept for compatibility, but we now get position from TF
+        pass
     
-    def _collect_gps_for_origin(self, lat, lon):
-        """Collect GPS samples and set origin when stabilized"""
-        # Skip invalid readings
-        if lat == 0.0 and lon == 0.0:
-            return
-        
-        # Collect samples
-        self.gps_init_samples_lat.append(lat)
-        self.gps_init_samples_lon.append(lon)
-        
-        num_samples = len(self.gps_init_samples_lat)
-        
-        # Wait for enough samples
-        if num_samples < self.gps_stabilization_samples:
-            self.get_logger().info(
-                f'Collecting GPS for origin: {num_samples}/{self.gps_stabilization_samples} samples',
+    def update_robot_position(self):
+        """Get current robot position from TF (map -> base_link)"""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.1)
+            )
+            self.current_x = transform.transform.translation.x
+            self.current_y = transform.transform.translation.y
+            return True
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(
+                f'Failed to get robot position from TF: {e}',
                 throttle_duration_sec=2
             )
-            return
-        
-        # Keep only recent samples
-        if num_samples > self.gps_stabilization_samples:
-            self.gps_init_samples_lat = self.gps_init_samples_lat[-self.gps_stabilization_samples:]
-            self.gps_init_samples_lon = self.gps_init_samples_lon[-self.gps_stabilization_samples:]
-        
-        # Calculate standard deviation to check stability
-        lat_mean = sum(self.gps_init_samples_lat) / len(self.gps_init_samples_lat)
-        lon_mean = sum(self.gps_init_samples_lon) / len(self.gps_init_samples_lon)
-        
-        lat_variance = sum((x - lat_mean) ** 2 for x in self.gps_init_samples_lat) / len(self.gps_init_samples_lat)
-        lon_variance = sum((x - lon_mean) ** 2 for x in self.gps_init_samples_lon) / len(self.gps_init_samples_lon)
-        
-        lat_std = math.sqrt(lat_variance)
-        lon_std = math.sqrt(lon_variance)
-        
-        # Check if GPS is stable enough
-        if lat_std <= self.gps_stabilization_threshold and lon_std <= self.gps_stabilization_threshold:
-            self.gps_origin_lat = lat_mean
-            self.gps_origin_lon = lon_mean
-            self.gps_origin_initialized = True
-            
-            self.get_logger().info(
-                f'GPS origin auto-set from stabilized readings: '
-                f'({self.gps_origin_lat:.6f}, {self.gps_origin_lon:.6f}) '
-                f'[std: lat={lat_std:.8f}, lon={lon_std:.8f}]'
-            )
-            
-            # Clear samples to free memory
-            self.gps_init_samples_lat = []
-            self.gps_init_samples_lon = []
-        else:
-            self.get_logger().info(
-                f'GPS not yet stable. std: lat={lat_std:.8f}, lon={lon_std:.8f} '
-                f'(threshold: {self.gps_stabilization_threshold})',
-                throttle_duration_sec=2
-            )
+            return False
 
     def cone_status_callback(self, msg):
         """Handle cone following status updates"""
@@ -409,239 +332,17 @@ class MissionManager(Node):
     def compass_callback(self, msg):
         """Handle compass heading from MAVROS"""
         self.current_heading = msg.data  # degrees, 0=North, clockwise
-    
-    def _try_calibrate_gps_to_map(self):
-        """
-        Attempt to calibrate the gps_map -> map transform.
-        
-        This runs on a timer until calibration succeeds, then cancels itself.
-        Requires:
-        - GPS origin initialized
-        - Valid compass heading
-        - TF available from map -> base_link
-        """
-        if self.gps_map_calibrated:
-            # Already calibrated, cancel timer
-            self.calibration_timer.cancel()
-            return
-        
-        # Only calibrate when rover is not actively navigating
-        if self.internal_state not in ['WAITING_FOR_PROCEED', 'WAITING_FOR_AUTONOMOUS']:
-            self.get_logger().info(
-                'Calibration waiting for rover to be idle (not navigating)...',
-                throttle_duration_sec=5
-            )
-            return
-
-        # Check prerequisites
-        if not self.gps_origin_initialized:
-            self.get_logger().info(
-                'Calibration waiting for GPS origin...',
-                throttle_duration_sec=5
-            )
-            return
-
-        # Snapshot current sensor values to avoid inconsistency during this call
-        lat = self.current_lat
-        lon = self.current_lon
-        heading = self.current_heading
-        
-        if lat == 0.0 and lon == 0.0:
-            self.get_logger().info(
-                'Calibration waiting for valid GPS position...',
-                throttle_duration_sec=5
-            )
-            return
-        
-        # Require stable heading over a short window to avoid calibrating while rotating
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-        self._calib_heading_samples.append(heading)
-        self._calib_heading_times.append(now_sec)
-        # Keep only recent samples (e.g., last 10)
-        max_samples = 10
-        if len(self._calib_heading_samples) > max_samples:
-            self._calib_heading_samples = self._calib_heading_samples[-max_samples:]
-            self._calib_heading_times = self._calib_heading_times[-max_samples:]
-
-        # Need at least a few samples spanning at least 2 seconds
-        if len(self._calib_heading_samples) < 3 or (now_sec - self._calib_heading_times[0]) < 2.0:
-            self.get_logger().info(
-                'Calibration collecting stable heading samples...',
-                throttle_duration_sec=5
-            )
-            return
-
-        h_min = min(self._calib_heading_samples)
-        h_max = max(self._calib_heading_samples)
-        if (h_max - h_min) > 2.0:  # more than 2 degrees change
-            self.get_logger().info(
-                'Calibration waiting for stable heading (rover may be turning)...',
-                throttle_duration_sec=5
-            )
-            return
-        
-        # Try to get robot pose in map frame from TF
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.map_frame,
-                self.base_frame,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=0.5)
-            )
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().info(
-                f'Calibration waiting for TF {self.map_frame} -> {self.base_frame}: {e}',
-                throttle_duration_sec=5
-            )
-            return
-        
-        # Extract robot position in map frame
-        x_map = transform.transform.translation.x
-        y_map = transform.transform.translation.y
-        
-        # Extract robot yaw in map frame from quaternion
-        q = transform.transform.rotation
-        # Convert quaternion to euler (roll, pitch, yaw)
-        euler = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
-        yaw_map = euler[2]  # yaw is the third element
-        
-        # Get robot position in gps_map (ENU) frame
-        x_gps, y_gps = self.gps_to_enu(lat, lon)
-        
-        # Get robot yaw in ENU from compass
-        # Compass: 0=North, 90=East, clockwise
-        # ENU yaw: 0=East, 90=North, counter-clockwise
-        yaw_gps = math.radians(90.0 - heading)
-        
-        # Compute rotation difference: how much to rotate gps_map to align with map
-        yaw_diff = yaw_map - yaw_gps
-        
-        # Normalize to [-pi, pi]
-        while yaw_diff > math.pi:
-            yaw_diff -= 2 * math.pi
-        while yaw_diff < -math.pi:
-            yaw_diff += 2 * math.pi
-        
-        # Compute translation:
-        # First rotate gps point by yaw_diff, then find translation to reach map point
-        c = math.cos(yaw_diff)
-        s = math.sin(yaw_diff)
-        xg_rot = x_gps * c - y_gps * s
-        yg_rot = x_gps * s + y_gps * c
-        
-        tx = x_map - xg_rot
-        ty = y_map - yg_rot
-        
-        # Store calibration
-        self.gps_map_to_map_yaw = yaw_diff
-        self.gps_map_to_map_tx = tx
-        self.gps_map_to_map_ty = ty
-        self.gps_map_calibrated = True
-        
-        self.get_logger().info(
-            f'=== GPS_MAP -> MAP Calibration Complete ===\n'
-            f'  Robot in map: ({x_map:.2f}, {y_map:.2f}), yaw={math.degrees(yaw_map):.1f}°\n'
-            f'  Robot in gps_map: ({x_gps:.2f}, {y_gps:.2f}), yaw={math.degrees(yaw_gps):.1f}°\n'
-            f'  Transform: yaw={math.degrees(yaw_diff):.1f}°, tx={tx:.2f}m, ty={ty:.2f}m'
-        )
-        
-        # Cancel the timer
-        self.calibration_timer.cancel()
-
-    def gps_to_enu(self, lat, lon):
-        """
-        Convert GPS coordinates to ENU (East-North-Up) coordinates.
-        This is the 'gps_map' frame - ENU centered at GPS origin.
-        
-        Returns (east, north) in meters.
-        """
-        if not self.gps_origin_initialized:
-            self.get_logger().warn(
-                'GPS origin not yet initialized!',
-                throttle_duration_sec=5
-            )
-            return 0.0, 0.0
-
-        # Earth radius in meters
-        R = 6371000.0
-
-        # Origin in radians
-        lat0 = math.radians(self.gps_origin_lat)
-
-        # Delta in radians
-        dlat = math.radians(lat - self.gps_origin_lat)
-        dlon = math.radians(lon - self.gps_origin_lon)
-
-        # ENU coordinates (equirectangular approximation)
-        east = R * dlon * math.cos(lat0)
-        north = R * dlat
-
-        return east, north
-    
-    def gps_to_map_coords(self, lat, lon):
-        """
-        Convert GPS coordinates to RTAB-Map's map frame coordinates.
-        
-        Pipeline:
-        1. GPS (lat, lon) -> gps_map frame (ENU)
-        2. Apply calibrated gps_map -> map transform
-        
-        Returns (x_map, y_map) in meters.
-        """
-        if not self.gps_origin_initialized:
-            self.get_logger().warn(
-                'GPS origin not yet initialized!',
-                throttle_duration_sec=5
-            )
-            return 0.0, 0.0
-        
-        if not self.gps_map_calibrated:
-            self.get_logger().warn(
-                'GPS->Map calibration not yet complete!',
-                throttle_duration_sec=5
-            )
-            return 0.0, 0.0
-
-        # Step 1: GPS -> gps_map (ENU)
-        east, north = self.gps_to_enu(lat, lon)
-
-        # Step 2: Apply gps_map -> map transform
-        # First rotate
-        c = math.cos(self.gps_map_to_map_yaw)
-        s = math.sin(self.gps_map_to_map_yaw)
-        x_rot = east * c - north * s
-        y_rot = east * s + north * c
-        
-        # Then translate
-        x_map = x_rot + self.gps_map_to_map_tx
-        y_map = y_rot + self.gps_map_to_map_ty
-
-        return x_map, y_map
 
     def send_nav2_goal(self):
-        """Send navigation goal to Nav2"""
+        """Send navigation goal to Nav2 using x, y map coordinates directly"""
         if not self.nav2_client.server_is_ready():
             self.get_logger().error('Nav2 action server not available!')
             self.internal_state = 'WAITING_FOR_PROCEED'
             return
-        
-        # Check if GPS origin is initialized
-        if not self.gps_origin_initialized:
-            self.get_logger().warn('Cannot navigate: GPS origin not yet initialized. Waiting for GPS to stabilize...')
-            self.internal_state = 'WAITING_FOR_AUTONOMOUS'
-            return
-        
-        # Check if GPS->Map calibration is complete
-        if not self.gps_map_calibrated:
-            self.get_logger().warn('Cannot navigate: GPS->Map calibration not yet complete. Waiting for TF...')
-            self.internal_state = 'WAITING_FOR_AUTONOMOUS'
-            return
 
-        # Convert GPS to map coordinates
-        x, y = self.gps_to_map_coords(
-            self.current_goal['lat'],
-            self.current_goal['lon']
-        )
+        # Get x, y directly from goal (already in map coordinates)
+        x = self.current_goal['x']
+        y = self.current_goal['y']
 
         # Create Nav2 goal
         goal_msg = NavigateToPose.Goal()
@@ -684,11 +385,11 @@ class MissionManager(Node):
         """Handle Nav2 navigation feedback"""
         feedback = feedback_msg.feedback
         
-        # Calculate distance to goal
-        if self.current_goal:
-            dist, _ = self.get_distance_bearing(
-                self.current_lat, self.current_lon,
-                self.current_goal['lat'], self.current_goal['lon']
+        # Calculate distance to goal using map coordinates
+        if self.current_goal and self.update_robot_position():
+            dist = self.get_distance_to_goal(
+                self.current_x, self.current_y,
+                self.current_goal['x'], self.current_goal['y']
             )
             
             self.get_logger().info(
@@ -760,7 +461,7 @@ class MissionManager(Node):
             self.get_logger().info(
                 f"Auto-proceeding to next waypoint ({self.mission_queue_index + 1}/{len(self.mission_queue)}): "
                 f"{self.current_goal['type']} {self.current_goal['color']} "
-                f"at ({self.current_goal['lat']:.6f}, {self.current_goal['lon']:.6f})"
+                f"at ({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
             )
             
             # Notify GUI of progress
@@ -789,28 +490,9 @@ class MissionManager(Node):
             self.current_goal = None
             self.get_logger().info("Switched to MANUAL mode. Ready for next mission.")
 
-    def get_distance_bearing(self, lat1, lon1, lat2, lon2):
-        """Calculate distance and bearing between two GPS coordinates"""
-        R = 6371000  # Earth radius in meters
-        
-        phi1 = math.radians(lat1)
-        phi2 = math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dlambda = math.radians(lon2 - lon1)
-        
-        # Haversine formula
-        a = (math.sin(dphi/2)**2 + 
-             math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2)
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        dist = R * c
-        
-        # Bearing calculation
-        y = math.sin(dlambda) * math.cos(phi2)
-        x = (math.cos(phi1) * math.sin(phi2) - 
-             math.sin(phi1) * math.cos(phi2) * math.cos(dlambda))
-        bearing = math.degrees(math.atan2(y, x))
-        
-        return dist, (bearing + 360) % 360
+    def get_distance_to_goal(self, x1, y1, x2, y2):
+        """Calculate Euclidean distance between two map coordinates"""
+        return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
 
     def control_loop(self):
         """Main control loop - minimal, most logic is event-driven"""
