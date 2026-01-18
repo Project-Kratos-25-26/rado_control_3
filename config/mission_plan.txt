@@ -4,3 +4,5 @@ pickup,orange,15.392697,73.881358
 pickup,orange,15.392697,73.881358
 pickup,green,15.39274,73.881379
 pickup,green,15.392740,73.881379
+dropoff,blue,15.392736,73.881358
+dropoff,blue,15.392736,73.881358

@@ -12,10 +12,8 @@ from std_msgs.msg import String, Float64
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import NavSatFix
 from nav2_msgs.action import NavigateToPose
-from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
+from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_pose
-from geometry_msgs.msg import TransformStamped
-import tf_transformations
 import os
 import time
 import math
@@ -73,8 +71,6 @@ class MissionManager(Node):
         self.current_lat = 0.0
         self.current_lon = 0.0
         self.current_heading = 0.0
-        self._calib_heading_samples = []
-        self._calib_heading_times = []
         
         # --- TUNING PARAMETERS ---
         self.cone_switch_distance = 0.5  # Meters - when to switch from Nav2 to cone following
@@ -136,19 +132,12 @@ class MissionManager(Node):
         self.get_logger().info('Mission Manager (Nav2 Integrated) Initialized.')
         self.get_logger().info(f'Loaded {len(self.mission_goals)} mission goals.')
         
-        # --- GPS_MAP to MAP calibration ---
-        # gps_map frame = ENU frame centered at GPS origin
-        # We need to find the transform from gps_map to RTAB-Map's map frame
-        self.gps_map_to_map_yaw = 0.0   # Rotation from gps_map to map (radians)
-        self.gps_map_to_map_tx = 0.0    # Translation X
-        self.gps_map_to_map_ty = 0.0    # Translation Y
-        self.gps_map_calibrated = False
+        # ENU to map rotation (radians). 0.0 = map Y-axis aligned with North
+        self.map_yaw = 0.0
+        self.map_yaw_initialized = False
         
         # Wait for Nav2 action server
         self.create_timer(1.0, self.check_nav2_ready)
-        
-        # Calibration timer - runs until calibration succeeds
-        self.calibration_timer = self.create_timer(1.0, self._try_calibrate_gps_to_map)
 
     def check_nav2_ready(self):
         """Check if Nav2 action server is available"""
@@ -407,153 +396,44 @@ class MissionManager(Node):
             self.handle_arrival()
 
     def compass_callback(self, msg):
-        """Handle compass heading from MAVROS"""
+        """Handle compass heading from MAVROS and compute map_yaw offset"""
         self.current_heading = msg.data  # degrees, 0=North, clockwise
+        
+        # Auto-initialize map_yaw when GPS origin is set
+        if self.gps_origin_initialized and not self.map_yaw_initialized:
+            self._compute_map_yaw_offset(msg.data)
     
-    def _try_calibrate_gps_to_map(self):
+    def _compute_map_yaw_offset(self, compass_heading_deg):
         """
-        Attempt to calibrate the gps_map -> map transform.
+        Compute the rotation offset between ENU frame and map frame.
         
-        This runs on a timer until calibration succeeds, then cancels itself.
-        Requires:
-        - GPS origin initialized
-        - Valid compass heading
-        - TF available from map -> base_link
+        This captures the robot's initial heading when the map was created.
+        Assumes the robot's initial orientation in map frame is (0,0,0).
+        
+        compass_heading_deg: degrees from North, clockwise (0=N, 90=E)
         """
-        if self.gps_map_calibrated:
-            # Already calibrated, cancel timer
-            self.calibration_timer.cancel()
-            return
-        
-        # Only calibrate when rover is not actively navigating
-        if self.internal_state not in ['WAITING_FOR_PROCEED', 'WAITING_FOR_AUTONOMOUS']:
-            self.get_logger().info(
-                'Calibration waiting for rover to be idle (not navigating)...',
-                throttle_duration_sec=5
-            )
-            return
-
-        # Check prerequisites
-        if not self.gps_origin_initialized:
-            self.get_logger().info(
-                'Calibration waiting for GPS origin...',
-                throttle_duration_sec=5
-            )
-            return
-
-        # Snapshot current sensor values to avoid inconsistency during this call
-        lat = self.current_lat
-        lon = self.current_lon
-        heading = self.current_heading
-        
-        if lat == 0.0 and lon == 0.0:
-            self.get_logger().info(
-                'Calibration waiting for valid GPS position...',
-                throttle_duration_sec=5
-            )
-            return
-        
-        # Require stable heading over a short window to avoid calibrating while rotating
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-        self._calib_heading_samples.append(heading)
-        self._calib_heading_times.append(now_sec)
-        # Keep only recent samples (e.g., last 10)
-        max_samples = 10
-        if len(self._calib_heading_samples) > max_samples:
-            self._calib_heading_samples = self._calib_heading_samples[-max_samples:]
-            self._calib_heading_times = self._calib_heading_times[-max_samples:]
-
-        # Need at least a few samples spanning at least 2 seconds
-        if len(self._calib_heading_samples) < 3 or (now_sec - self._calib_heading_times[0]) < 2.0:
-            self.get_logger().info(
-                'Calibration collecting stable heading samples...',
-                throttle_duration_sec=5
-            )
-            return
-
-        h_min = min(self._calib_heading_samples)
-        h_max = max(self._calib_heading_samples)
-        if (h_max - h_min) > 2.0:  # more than 2 degrees change
-            self.get_logger().info(
-                'Calibration waiting for stable heading (rover may be turning)...',
-                throttle_duration_sec=5
-            )
-            return
-        
-        # Try to get robot pose in map frame from TF
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.map_frame,
-                self.base_frame,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=0.5)
-            )
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().info(
-                f'Calibration waiting for TF {self.map_frame} -> {self.base_frame}: {e}',
-                throttle_duration_sec=5
-            )
-            return
-        
-        # Extract robot position in map frame
-        x_map = transform.transform.translation.x
-        y_map = transform.transform.translation.y
-        
-        # Extract robot yaw in map frame from quaternion
-        q = transform.transform.rotation
-        # Convert quaternion to euler (roll, pitch, yaw)
-        euler = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
-        yaw_map = euler[2]  # yaw is the third element
-        
-        # Get robot position in gps_map (ENU) frame
-        x_gps, y_gps = self.gps_to_enu(lat, lon)
-        
-        # Get robot yaw in ENU from compass
+        # Convert compass heading to ENU yaw
         # Compass: 0=North, 90=East, clockwise
         # ENU yaw: 0=East, 90=North, counter-clockwise
-        yaw_gps = math.radians(90.0 - heading)
+        # ENU yaw = 90 - compass_heading
+        enu_yaw_deg = 90.0 - compass_heading_deg
+        enu_yaw_rad = math.radians(enu_yaw_deg)
         
-        # Compute rotation difference: how much to rotate gps_map to align with map
-        yaw_diff = yaw_map - yaw_gps
-        
-        # Normalize to [-pi, pi]
-        while yaw_diff > math.pi:
-            yaw_diff -= 2 * math.pi
-        while yaw_diff < -math.pi:
-            yaw_diff += 2 * math.pi
-        
-        # Compute translation:
-        # First rotate gps point by yaw_diff, then find translation to reach map point
-        c = math.cos(yaw_diff)
-        s = math.sin(yaw_diff)
-        xg_rot = x_gps * c - y_gps * s
-        yg_rot = x_gps * s + y_gps * c
-        
-        tx = x_map - xg_rot
-        ty = y_map - yg_rot
-        
-        # Store calibration
-        self.gps_map_to_map_yaw = yaw_diff
-        self.gps_map_to_map_tx = tx
-        self.gps_map_to_map_ty = ty
-        self.gps_map_calibrated = True
+        # The map_yaw is the rotation from ENU to map frame
+        # If robot started facing North (compass=0), ENU yaw=90deg
+        # If map frame has robot at yaw=0, then map_yaw = -enu_yaw
+        self.map_yaw = -enu_yaw_rad
+        self.map_yaw_initialized = True
         
         self.get_logger().info(
-            f'=== GPS_MAP -> MAP Calibration Complete ===\n'
-            f'  Robot in map: ({x_map:.2f}, {y_map:.2f}), yaw={math.degrees(yaw_map):.1f}°\n'
-            f'  Robot in gps_map: ({x_gps:.2f}, {y_gps:.2f}), yaw={math.degrees(yaw_gps):.1f}°\n'
-            f'  Transform: yaw={math.degrees(yaw_diff):.1f}°, tx={tx:.2f}m, ty={ty:.2f}m'
+            f'Map yaw offset computed: {math.degrees(self.map_yaw):.2f} deg '
+            f'(compass heading: {compass_heading_deg:.2f} deg)'
         )
-        
-        # Cancel the timer
-        self.calibration_timer.cancel()
 
-    def gps_to_enu(self, lat, lon):
+    def gps_to_map_coords(self, lat, lon):
         """
-        Convert GPS coordinates to ENU (East-North-Up) coordinates.
-        This is the 'gps_map' frame - ENU centered at GPS origin.
-        
-        Returns (east, north) in meters.
+        Convert GPS coordinates to map coordinates.
+        Uses equirectangular projection to ENU, then rotates to map frame.
         """
         if not self.gps_origin_initialized:
             self.get_logger().warn(
@@ -572,49 +452,13 @@ class MissionManager(Node):
         dlat = math.radians(lat - self.gps_origin_lat)
         dlon = math.radians(lon - self.gps_origin_lon)
 
-        # ENU coordinates (equirectangular approximation)
+        # --- ENU coordinates ---
         east = R * dlon * math.cos(lat0)
         north = R * dlat
 
-        return east, north
-    
-    def gps_to_map_coords(self, lat, lon):
-        """
-        Convert GPS coordinates to RTAB-Map's map frame coordinates.
-        
-        Pipeline:
-        1. GPS (lat, lon) -> gps_map frame (ENU)
-        2. Apply calibrated gps_map -> map transform
-        
-        Returns (x_map, y_map) in meters.
-        """
-        if not self.gps_origin_initialized:
-            self.get_logger().warn(
-                'GPS origin not yet initialized!',
-                throttle_duration_sec=5
-            )
-            return 0.0, 0.0
-        
-        if not self.gps_map_calibrated:
-            self.get_logger().warn(
-                'GPS->Map calibration not yet complete!',
-                throttle_duration_sec=5
-            )
-            return 0.0, 0.0
-
-        # Step 1: GPS -> gps_map (ENU)
-        east, north = self.gps_to_enu(lat, lon)
-
-        # Step 2: Apply gps_map -> map transform
-        # First rotate
-        c = math.cos(self.gps_map_to_map_yaw)
-        s = math.sin(self.gps_map_to_map_yaw)
-        x_rot = east * c - north * s
-        y_rot = east * s + north * c
-        
-        # Then translate
-        x_map = x_rot + self.gps_map_to_map_tx
-        y_map = y_rot + self.gps_map_to_map_ty
+        # --- Rotate ENU → map ---
+        x_map = east * math.cos(self.map_yaw) - north * math.sin(self.map_yaw)
+        y_map = east * math.sin(self.map_yaw) + north * math.cos(self.map_yaw)
 
         return x_map, y_map
 
@@ -628,12 +472,6 @@ class MissionManager(Node):
         # Check if GPS origin is initialized
         if not self.gps_origin_initialized:
             self.get_logger().warn('Cannot navigate: GPS origin not yet initialized. Waiting for GPS to stabilize...')
-            self.internal_state = 'WAITING_FOR_AUTONOMOUS'
-            return
-        
-        # Check if GPS->Map calibration is complete
-        if not self.gps_map_calibrated:
-            self.get_logger().warn('Cannot navigate: GPS->Map calibration not yet complete. Waiting for TF...')
             self.internal_state = 'WAITING_FOR_AUTONOMOUS'
             return
 
