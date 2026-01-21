@@ -1,10 +1,4 @@
-pickup,yellow,15.392706,73.88136
-pickup,yellow,15.392706,73.881360
-pickup,orange,15.392697,73.881358
-pickup,orange,15.392697,73.881358
-pickup,green,15.39274,73.881379
-pickup,green,15.392740,73.881379
-pickup,blue,15.392693,73.881335
-pickup,blue,15.392693,73.881335
-dropoff,blue,15.3927,73.881415
-dropoff,blue,15.392700,73.881415
+pickup,orange,1.161,-0.614
+pickup,green,8.877,15.263
+pickup,red,0.000,0.000
+dropoff,orange,0.001,-0.000

@@ -13,7 +13,6 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import NavSatFix
 from nav2_msgs.action import NavigateToPose
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
-import tf_transformations
 import os
 import time
 import math
@@ -23,11 +22,6 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 class MissionManager(Node):
     def __init__(self):
         super().__init__('mission_manager')
-        self.mavros_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT
-        )
 
         # Parameters
         self.declare_parameter('map_frame', 'map')
@@ -38,14 +32,9 @@ class MissionManager(Node):
 
         # State machine
         self.internal_state = 'WAITING_FOR_AUTONOMOUS'
-        self.mission_goals = []
-        self.current_goal = None
-        self.current_goal_index = -1
-        self.queue_index = -1  # For GUI queue tracking
         
-        # Mission queue from GUI (stores all waypoints for this PROCEED press)
-        self.mission_queue = []  # List of goals to process
-        self.mission_queue_index = 0  # Current position in queue
+        self.current_goal = None
+        
         
         # Navigation State (robot position in map frame)
         self.current_x = 0.0
@@ -53,7 +42,7 @@ class MissionManager(Node):
         self.current_heading = 0.0
         
         # --- TUNING PARAMETERS ---
-        self.cone_switch_distance = 0.5  # Meters - when to switch from Nav2 to cone following
+        self.cone_switch_distance = 3  # Meters - when to switch from Nav2 to cone following
         self.nav2_goal_tolerance = 2.0   # Nav2 goal tolerance
         self.nav2_timeout = 300.0        # Nav2 navigation timeout (seconds)
         # -------------------------
@@ -79,16 +68,10 @@ class MissionManager(Node):
 
         # Subscribers
         self.create_subscription(
-            String, '/rover_state', self.state_callback, 10
+            String, '/system/state', self.state_callback, 10
         )
         self.create_subscription(
             String, '/gcs/command', self.gcs_command_callback, 10
-        )
-        self.create_subscription(
-            NavSatFix, '/mavros/global_position/global', self.gps_callback, self.mavros_qos
-        )
-        self.create_subscription(
-            Float64, '/mavros/global_position/compass_hdg', self.compass_callback, self.mavros_qos
         )
         self.create_subscription(
             String, '/auto/cone_follow/status', self.cone_status_callback, 10
@@ -106,11 +89,11 @@ class MissionManager(Node):
         self.timer = self.create_timer(0.2, self.control_loop)
         
         # Load mission and wait for Nav2
-        self.load_mission()
+
         self.internal_state = 'WAITING_FOR_PROCEED'
         
         self.get_logger().info('Mission Manager (Nav2 Integrated) Initialized.')
-        self.get_logger().info(f'Loaded {len(self.mission_goals)} mission goals.')
+        self.get_logger().info(f'Loaded(self.current_goal) mission goal.')
         
         # Wait for Nav2 action server
         self.create_timer(1.0, self.check_nav2_ready)
@@ -122,30 +105,6 @@ class MissionManager(Node):
         else:
             self.get_logger().info('Nav2 action server is ready!')
 
-    def load_mission(self):
-        """Load mission waypoints from file (x, y in map coordinates)"""
-        self.mission_goals = []
-        try:
-            if os.path.exists(self.mission_file_path):
-                with open(self.mission_file_path, 'r') as f:
-                    for line in f:
-                        parts = line.strip().split(',')
-                        if len(parts) == 4:
-                            try:
-                                goal = {
-                                    'type': parts[0].lower().strip(),
-                                    'color': parts[1].lower().strip(),
-                                    'x': float(parts[2]),
-                                    'y': float(parts[3])
-                                }
-                                self.mission_goals.append(goal)
-                            except ValueError as e:
-                                self.get_logger().warn(f'Invalid line in mission file: {line}')
-            else:
-                self.get_logger().error(f'Mission file not found: {self.mission_file_path}')
-        except Exception as e:
-            self.get_logger().error(f'Failed to load mission: {e}')
-
     def gcs_command_callback(self, msg):
         """Handle commands from ground control station"""
         command = msg.data.upper().strip()
@@ -153,147 +112,70 @@ class MissionManager(Node):
         if command == 'PROCEED':
             if self.internal_state == 'WAITING_FOR_PROCEED':
                 # Start processing the mission queue from the beginning
-                self.mission_queue_index = 0
+                
                 
                 # Clean up the queue (remove None entries)
-                self.mission_queue = [g for g in self.mission_queue if g is not None]
-                
-                if len(self.mission_queue) > 0:
-                    self.current_goal = self.mission_queue[0]
-                    self.get_logger().info(
-                        f"Starting mission queue ({len(self.mission_queue)} waypoints). "
-                        f"First: {self.current_goal['type']} {self.current_goal['color']} "
-                        f"at ({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
-                    )
-                    # Start navigation immediately
+                if self.current_goal:
                     self.internal_state = 'NAV2_NAVIGATING'
-                    self.send_nav2_goal()
-                elif self.current_goal:
-                    # Fallback to single goal mode
-                    self.mission_queue = [self.current_goal]
-                    self.mission_queue_index = 0
                     self.get_logger().info(
                         f"Proceeding to goal: {self.current_goal['type']} "
                         f"{self.current_goal['color']} at ({self.current_goal['x']:.2f}, "
                         f"{self.current_goal['y']:.2f})"
                     )
-                    # Start navigation immediately
-                    self.internal_state = 'NAV2_NAVIGATING'
                     self.send_nav2_goal()
                 else:
-                    self.get_logger().warn("No waypoints in queue. Add waypoints first.")
+                    self.get_logger().warn("No goal set.")
         elif command == 'MANUAL':
             self.internal_state = 'WAITING_FOR_PROCEED'
             self.cancel_nav2_goal()
             self.cone_trigger_pub.publish(String(data="STOP"))
             # Clear the queue on manual stop
-            self.mission_queue = []
-            self.mission_queue_index = 0
+            
+            
             self.get_logger().info("Mission stopped. Queue cleared.")
         elif command == 'CANCEL':
             self.cancel_nav2_goal()
             self.internal_state = 'WAITING_FOR_PROCEED'
 
     def set_goal_callback(self, msg):
-        """Handle goal selection from GUI - adds to mission queue"""
         try:
             parts = msg.data.split('|')
-            
-            # New queue format: QUEUE|index|type|color|x|y
-            if len(parts) >= 6 and parts[0] == 'QUEUE':
-                queue_idx = int(parts[1])
-                goal_type = parts[2].lower().strip()
-                color = parts[3].lower().strip()
-                x = float(parts[4])
-                y = float(parts[5])
-                
-                goal = {
-                    'type': goal_type,
-                    'color': color,
-                    'x': x,
-                    'y': y,
-                    'queue_index': queue_idx
-                }
-                
-                # Add to mission queue (replace if same index exists, or append)
-                while len(self.mission_queue) <= queue_idx:
-                    self.mission_queue.append(None)
-                self.mission_queue[queue_idx] = goal
-                
-                # Set as current goal for immediate reference
-                self.current_goal = goal
-                
-                self.get_logger().info(
-                    f"Queue Goal #{queue_idx + 1} Added: {goal_type} {color} at ({x:.2f}, {y:.2f}). Queue size: {len([g for g in self.mission_queue if g])}"
-                )
-                self.internal_state = 'WAITING_FOR_PROCEED'
-            
-            # Legacy format: GOAL|type|color|x|y
-            elif len(parts) >= 5 and parts[0] == 'GOAL':
-                goal_type = parts[1].lower().strip()
-                color = parts[2].lower().strip()
-                x = float(parts[3])
-                y = float(parts[4])
-                
+
+        
+            if len(parts) == 5 and parts[0] == 'GOAL':
                 self.current_goal = {
-                    'type': goal_type,
-                    'color': color,
-                    'x': x,
-                    'y': y,
-                    'queue_index': -1
+                    'type': parts[1].lower().strip(),
+                    'color': parts[2].lower().strip(),
+                    'x': float(parts[3]),
+                    'y': float(parts[4])
                 }
-                
-                # For legacy, just set as single goal
-                self.mission_queue = [self.current_goal]
-                self.mission_queue_index = 0
-                
-                self.get_logger().info(
-                    f"GUI Goal Set: {goal_type} {color} at ({x:.2f}, {y:.2f})"
-                )
+
                 self.internal_state = 'WAITING_FOR_PROCEED'
+                self.get_logger().info(
+                f"Goal set: {self.current_goal['type']} "
+                f"{self.current_goal['color']} at "
+                f"({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
+                )
             else:
                 self.get_logger().warn(f"Invalid goal format: {msg.data}")
         except Exception as e:
             self.get_logger().error(f"Failed to parse goal: {e}")
 
-    def select_next_goal(self):
-        """Select the next goal in mission sequence"""
-        next_goal = None
-        
-        # If we just completed a pickup, find matching dropoff
-        if self.current_goal and self.current_goal['type'] == 'pickup':
-            color = self.current_goal['color']
-            for g in self.mission_goals:
-                if g['type'] == 'dropoff' and g['color'] == color:
-                    next_goal = g
-                    break
-        else:
-            # Find next pickup
-            start_search = self.current_goal_index + 1
-            for i in range(start_search, len(self.mission_goals)):
-                if self.mission_goals[i]['type'] == 'pickup':
-                    next_goal = self.mission_goals[i]
-                    self.current_goal_index = i
-                    break
-        
-        if next_goal:
-            self.current_goal = next_goal
-            self.get_logger().info(
-                f"Selected Goal: {next_goal['type']} {next_goal['color']} "
-                f"at ({next_goal['x']:.2f}, {next_goal['y']:.2f})"
-            )
-            self.internal_state = 'WAITING_FOR_AUTONOMOUS'
-        else:
-            self.get_logger().info("No more goals found. Mission complete!")
-            self.internal_state = 'IDLE'
 
     def state_callback(self, msg):
         """Handle rover state changes"""
         state = msg.data.upper().strip()
         
-        if state == 'AUTONOMOUS' and self.internal_state == 'WAITING_FOR_AUTONOMOUS':
-            self.internal_state = 'NAV2_NAVIGATING'
-            self.send_nav2_goal()
+        if state == 'AUTONOMOUS' and self.internal_state in ['WAITING_FOR_AUTONOMOUS', 'WAITING_FOR_PROCEED']:
+            if self.current_goal:
+                self.internal_state = 'NAV2_NAVIGATING'
+                self.get_logger().info(
+                    f"AUTONOMOUS received - navigating to {self.current_goal['type']} "
+                    f"{self.current_goal['color']} at ({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
+                )
+                self.send_nav2_goal()
+            else:
+                self.get_logger().warn("AUTONOMOUS state received but no goal is set!")
         elif state == 'MANUAL':
             if self.internal_state in ['NAV2_NAVIGATING', 'CONE_NAVIGATING']:
                 self.internal_state = 'WAITING_FOR_PROCEED'
@@ -328,10 +210,6 @@ class MissionManager(Node):
         """Handle cone following status updates"""
         if self.internal_state == 'CONE_NAVIGATING' and msg.data == 'SUCCESS':
             self.handle_arrival()
-
-    def compass_callback(self, msg):
-        """Handle compass heading from MAVROS"""
-        self.current_heading = msg.data  # degrees, 0=North, clockwise
 
     def send_nav2_goal(self):
         """Send navigation goal to Nav2 using x, y map coordinates directly"""
@@ -397,16 +275,7 @@ class MissionManager(Node):
                 throttle_duration_sec=2
             )
             
-            # Switch to cone following when close enough
-            if dist < self.cone_switch_distance:
-                self.get_logger().info(
-                    f'Within {dist:.2f}m. Canceling Nav2, switching to CONE FOLLOW.'
-                )
-                self.cancel_nav2_goal()
-                self.internal_state = 'CONE_NAVIGATING'
-                # Send color|type so cone follower knows if this is pickup or dropoff
-                trigger_msg = f"{self.current_goal['color']}|{self.current_goal['type']}"
-                self.cone_trigger_pub.publish(String(data=trigger_msg))
+
 
     def nav2_result_callback(self, future):
         """Handle Nav2 navigation result"""
@@ -422,6 +291,9 @@ class MissionManager(Node):
             self.cone_trigger_pub.publish(String(data=trigger_msg))
         elif status == 5:  # CANCELED
             self.get_logger().info('Nav2 navigation was canceled')
+        elif status == 6:  # aborted
+            self.get_logger().info('Nav2 navigation was aborted')
+        
         else:
             self.get_logger().error(f'Nav2 navigation failed with status: {status}')
             self.internal_state = 'WAITING_FOR_PROCEED'
@@ -434,61 +306,26 @@ class MissionManager(Node):
             self.nav2_goal_handle = None
 
     def handle_arrival(self):
-        """Handle arrival at goal location - auto-proceed to next waypoint"""
         self.get_logger().info(
             f"Arrived at {self.current_goal['type']} ({self.current_goal['color']})"
         )
         
-        queue_idx = self.current_goal.get('queue_index', -1)
+
         
         # Notify GUI of completion
         status_msg = String()
-        status_msg.data = f"COMPLETE|{queue_idx}|{self.current_goal['type']}"
+        status_msg.data = f"COMPLETE|{self.current_goal['type']}"
         self.mission_status_pub.publish(status_msg)
         
         self.get_logger().info(f"{self.current_goal['type'].capitalize()} complete at {self.current_goal['color']}")
         
         # Auto-proceed to next waypoint in queue
-        self.proceed_to_next_waypoint()
+        self.cone_trigger_pub.publish(String(data="STOP"))
+        self.internal_state = 'WAITING_FOR_PROCEED'  # same as manual stop
+        self.current_goal = None
+        self.get_logger().info("Cone follow complete. Switched to MANUAL mode.")
 
-    def proceed_to_next_waypoint(self):
-        """Move to the next waypoint in the mission queue, or finish if done"""
-        self.mission_queue_index += 1
-        
-        if self.mission_queue_index < len(self.mission_queue):
-            # More waypoints to go
-            self.current_goal = self.mission_queue[self.mission_queue_index]
-            self.get_logger().info(
-                f"Auto-proceeding to next waypoint ({self.mission_queue_index + 1}/{len(self.mission_queue)}): "
-                f"{self.current_goal['type']} {self.current_goal['color']} "
-                f"at ({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
-            )
-            
-            # Notify GUI of progress
-            status_msg = String()
-            status_msg.data = f"NAVIGATING|{self.mission_queue_index}|{self.current_goal['type']}"
-            self.mission_status_pub.publish(status_msg)
-            
-            # Start navigation to next goal
-            self.internal_state = 'NAV2_NAVIGATING'
-            self.send_nav2_goal()
-        else:
-            # All waypoints complete!
-            self.get_logger().info(
-                f"=== MISSION COMPLETE === All {len(self.mission_queue)} waypoints completed!"
-            )
-            
-            # Notify GUI
-            status_msg = String()
-            status_msg.data = "MISSION_COMPLETE"
-            self.mission_status_pub.publish(status_msg)
-            
-            # Now switch to manual mode
-            self.internal_state = 'WAITING_FOR_PROCEED'
-            self.mission_queue = []
-            self.mission_queue_index = 0
-            self.current_goal = None
-            self.get_logger().info("Switched to MANUAL mode. Ready for next mission.")
+
 
     def get_distance_to_goal(self, x1, y1, x2, y2):
         """Calculate Euclidean distance between two map coordinates"""
