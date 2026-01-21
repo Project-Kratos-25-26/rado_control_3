@@ -33,6 +33,9 @@ class MissionManager(Node):
         # State machine
         self.internal_state = 'WAITING_FOR_AUTONOMOUS'
         
+        # Goal queue: {0: goal_dict, 1: goal_dict}
+        self.goal_queue = {}
+        self.current_goal_index = 0
         self.current_goal = None
         
         
@@ -141,20 +144,48 @@ class MissionManager(Node):
         try:
             parts = msg.data.split('|')
 
+            # New QUEUE format: QUEUE|INDEX|type|color|x|y
+            if len(parts) == 6 and parts[0] == 'QUEUE':
+                index = int(parts[1])
+                if index not in [0, 1]:
+                    self.get_logger().warn(f"Invalid queue index: {index}. Must be 0 or 1.")
+                    return
+                
+                goal = {
+                    'type': parts[2].lower().strip(),
+                    'color': parts[3].lower().strip(),
+                    'x': float(parts[4]),
+                    'y': float(parts[5])
+                }
+                self.goal_queue[index] = goal
+                self.get_logger().info(
+                    f"Queue[{index}] set: {goal['type']} {goal['color']} at "
+                    f"({goal['x']:.2f}, {goal['y']:.2f})"
+                )
+                
+                # If both goals are set, prepare to start
+                if 0 in self.goal_queue and 1 in self.goal_queue:
+                    self.current_goal_index = 0
+                    self.current_goal = self.goal_queue[0]
+                    self.internal_state = 'WAITING_FOR_PROCEED'
+                    self.get_logger().info("Both goals queued. Ready to proceed.")
         
-            if len(parts) == 5 and parts[0] == 'GOAL':
+            # Legacy GOAL format: GOAL|type|color|x|y
+            elif len(parts) == 5 and parts[0] == 'GOAL':
                 self.current_goal = {
                     'type': parts[1].lower().strip(),
                     'color': parts[2].lower().strip(),
                     'x': float(parts[3]),
                     'y': float(parts[4])
                 }
+                self.goal_queue = {}  # Clear queue for legacy mode
+                self.current_goal_index = -1  # Indicate legacy mode
 
                 self.internal_state = 'WAITING_FOR_PROCEED'
                 self.get_logger().info(
-                f"Goal set: {self.current_goal['type']} "
-                f"{self.current_goal['color']} at "
-                f"({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
+                    f"Goal set: {self.current_goal['type']} "
+                    f"{self.current_goal['color']} at "
+                    f"({self.current_goal['x']:.2f}, {self.current_goal['y']:.2f})"
                 )
             else:
                 self.get_logger().warn(f"Invalid goal format: {msg.data}")
@@ -284,16 +315,29 @@ class MissionManager(Node):
         
         if status == 4:  # SUCCEEDED
             self.get_logger().info('Nav2 navigation succeeded!')
-            # Switch to cone following for final approach
-            self.internal_state = 'CONE_NAVIGATING'
-            # Send color|type so cone follower knows if this is pickup or dropoff
-            trigger_msg = f"{self.current_goal['color']}|{self.current_goal['type']}"
-            self.cone_trigger_pub.publish(String(data=trigger_msg))
+            
+            # Index 0: Switch to cone following for final approach
+            if self.current_goal_index == 0:
+                self.internal_state = 'CONE_NAVIGATING'
+                # Send color|type so cone follower knows if this is pickup or dropoff
+                trigger_msg = f"{self.current_goal['color']}|{self.current_goal['type']}"
+                self.cone_trigger_pub.publish(String(data=trigger_msg))
+            
+            # Index 1: Nav2 only, no cone following - mission complete
+            elif self.current_goal_index == 1:
+                self.get_logger().info('Index 1 Nav2 goal complete. Switching to MANUAL.')
+                self.handle_mission_complete()
+            
+            # Legacy mode (single goal): use cone following
+            else:
+                self.internal_state = 'CONE_NAVIGATING'
+                trigger_msg = f"{self.current_goal['color']}|{self.current_goal['type']}"
+                self.cone_trigger_pub.publish(String(data=trigger_msg))
+                
         elif status == 5:  # CANCELED
             self.get_logger().info('Nav2 navigation was canceled')
-        elif status == 6:  # aborted
+        elif status == 6:  # ABORTED
             self.get_logger().info('Nav2 navigation was aborted')
-        
         else:
             self.get_logger().error(f'Nav2 navigation failed with status: {status}')
             self.internal_state = 'WAITING_FOR_PROCEED'
@@ -306,11 +350,13 @@ class MissionManager(Node):
             self.nav2_goal_handle = None
 
     def handle_arrival(self):
+        """Called when cone following succeeds for current goal"""
         self.get_logger().info(
             f"Arrived at {self.current_goal['type']} ({self.current_goal['color']})"
         )
         
-
+        # Stop cone following
+        self.cone_trigger_pub.publish(String(data="STOP"))
         
         # Notify GUI of completion
         status_msg = String()
@@ -319,11 +365,34 @@ class MissionManager(Node):
         
         self.get_logger().info(f"{self.current_goal['type'].capitalize()} complete at {self.current_goal['color']}")
         
-        # Auto-proceed to next waypoint in queue
-        self.cone_trigger_pub.publish(String(data="STOP"))
-        self.internal_state = 'WAITING_FOR_PROCEED'  # same as manual stop
+        # If using queue and just finished index 0, proceed to index 1
+        if self.current_goal_index == 0 and 1 in self.goal_queue:
+            self.get_logger().info("Index 0 complete. Proceeding to index 1...")
+            self.current_goal_index = 1
+            self.current_goal = self.goal_queue[1]
+            self.internal_state = 'NAV2_NAVIGATING'
+            self.send_nav2_goal()
+        else:
+            # Legacy mode or no more goals - switch to manual
+            self.internal_state = 'WAITING_FOR_PROCEED'
+            self.current_goal = None
+            self.get_logger().info("Cone follow complete. Switched to MANUAL mode.")
+    
+    def handle_mission_complete(self):
+        """Called when entire mission queue is complete (after index 1 Nav2 succeeds)"""
+        self.get_logger().info("Mission complete! Both goals reached.")
+        
+        # Notify GUI
+        status_msg = String()
+        status_msg.data = f"COMPLETE|{self.current_goal['type']}"
+        self.mission_status_pub.publish(status_msg)
+        
+        # Clear state
+        self.goal_queue = {}
         self.current_goal = None
-        self.get_logger().info("Cone follow complete. Switched to MANUAL mode.")
+        self.current_goal_index = 0
+        self.internal_state = 'WAITING_FOR_PROCEED'
+        self.get_logger().info("Switched to MANUAL mode.")
 
 
 
